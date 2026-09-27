@@ -65,9 +65,10 @@ func modDiskInfo(root string) (int64, time.Time) {
 		if err != nil {
 			return nil
 		}
-		if !info.IsDir() {
-			size += info.Size()
+		if info.IsDir() {
+			return nil
 		}
+		size += info.Size()
 		if info.ModTime().After(latest) {
 			latest = info.ModTime()
 		}

@@ -929,6 +929,11 @@ func extractArchive(settings Settings, archive string) (string, error) {
 		if e != nil {
 			return "", e
 		}
+		if modTime := f.ModTime(); !modTime.IsZero() {
+			if e = os.Chtimes(p, modTime, modTime); e != nil {
+				return "", e
+			}
+		}
 	}
 	return dir, nil
 }
@@ -942,7 +947,7 @@ func extractArchiveContents(path, dest string) error {
 		}
 		defer r.Close()
 		for _, f := range r.File {
-			if err := extractArchiveEntry(dest, f.Name, f.FileInfo().IsDir(), f.Open); err != nil {
+			if err := extractArchiveEntry(dest, f.Name, f.FileInfo().IsDir(), f.FileInfo().ModTime(), f.Open); err != nil {
 				return err
 			}
 		}
@@ -961,7 +966,7 @@ func extractArchiveContents(path, dest string) error {
 			if err != nil {
 				return err
 			}
-			if err := extractArchiveEntry(dest, h.Name, h.IsDir, func() (io.ReadCloser, error) { return io.NopCloser(r), nil }); err != nil {
+			if err := extractArchiveEntry(dest, h.Name, h.IsDir, h.ModificationTime, func() (io.ReadCloser, error) { return io.NopCloser(r), nil }); err != nil {
 				return err
 			}
 		}
@@ -970,13 +975,19 @@ func extractArchiveContents(path, dest string) error {
 	}
 }
 
-func extractArchiveEntry(dest, name string, isDir bool, open func() (io.ReadCloser, error)) error {
+func extractArchiveEntry(dest, name string, isDir bool, modTime time.Time, open func() (io.ReadCloser, error)) error {
 	p := filepath.Join(dest, filepath.Clean(filepath.FromSlash(name)))
 	if !strings.HasPrefix(p, filepath.Clean(dest)+string(os.PathSeparator)) {
 		return errors.New("archive contains unsafe path")
 	}
 	if isDir {
-		return os.MkdirAll(p, 0755)
+		if err := os.MkdirAll(p, 0755); err != nil {
+			return err
+		}
+		if !modTime.IsZero() {
+			return os.Chtimes(p, modTime, modTime)
+		}
+		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
 		return err
@@ -995,7 +1006,13 @@ func extractArchiveEntry(dest, name string, isDir bool, open func() (io.ReadClos
 	if copyErr != nil {
 		return copyErr
 	}
-	return closeErr
+	if closeErr != nil {
+		return closeErr
+	}
+	if !modTime.IsZero() {
+		return os.Chtimes(p, modTime, modTime)
+	}
+	return nil
 }
 
 func findManifestDir(root string) (string, error) {
@@ -1078,6 +1095,10 @@ func paths(root string, ps []string) []string {
 	return out
 }
 func copyFile(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -1092,7 +1113,10 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	return cerr
+	if cerr != nil {
+		return cerr
+	}
+	return os.Chtimes(dst, info.ModTime(), info.ModTime())
 }
 func ImportArchive(settings Settings, archive string) (*Mod, error) {
 	return importArchive(settings, archive, false)
@@ -1135,8 +1159,24 @@ func importArchive(settings Settings, archive string, replace bool) (*Mod, error
 	}
 	if _, err := os.Stat(filepath.Join(manifestDir, "manifest.json")); os.IsNotExist(err) {
 		data, _ := json.MarshalIndent(manifest, "", "  ")
-		if err := os.WriteFile(filepath.Join(manifestDir, "manifest.json"), data, 0644); err != nil {
+		manifestPath := filepath.Join(manifestDir, "manifest.json")
+		// Capture the newest original file before writing the generated manifest;
+		// otherwise the generated file would look like a fresh modification.
+		originalTime := latestFileModTime(manifestDir)
+		if originalTime.IsZero() {
+			if info, statErr := os.Stat(archive); statErr == nil {
+				originalTime = info.ModTime()
+			}
+		}
+		if err := os.WriteFile(manifestPath, data, 0644); err != nil {
 			return nil, err
+		}
+		// The generated manifest must not make the imported mod appear newly
+		// modified. Keep its timestamp aligned with the newest original file.
+		if !originalTime.IsZero() {
+			if err := os.Chtimes(manifestPath, originalTime, originalTime); err != nil {
+				return nil, err
+			}
 		}
 	}
 	name := manifest.Name
@@ -1186,4 +1226,19 @@ func copyDir(src, dst string) error {
 		}
 		return copyFile(path, target)
 	})
+}
+
+func latestFileModTime(root string) time.Time {
+	var latest time.Time
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err == nil && info.ModTime().After(latest) {
+			latest = info.ModTime()
+		}
+		return nil
+	})
+	return latest
 }
